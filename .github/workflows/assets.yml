@@ -1,0 +1,85 @@
+# One-time (re-runnable) fetch of the real NASA star map. The dev sandbox
+# cannot reach nasa.gov, but Actions runners can: this downloads the NASA SVS
+# "Deep Star Maps 2020" HDR EXR, tone-maps and downsamples it, encodes a
+# KTX2 (GPU-compressed, mipmapped) primary + JPEG fallback, and commits both
+# to the branch it was dispatched on. The app automatically prefers these
+# over its procedural fallback sky.
+#
+# Source: https://svs.gsfc.nasa.gov/4851
+# Credit: NASA/Goddard Space Flight Center Scientific Visualization Studio.
+#         Gaia DR2: ESA/Gaia/DPAC.
+name: Fetch NASA star map assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Source EXR (galactic = Milky Way along equator)'
+        default: 'starmap_2020_16k_gal.exr'
+        type: choice
+        options:
+          - starmap_2020_16k_gal.exr
+          - starmap_2020_16k.exr
+          - starmap_2020_8k_gal.exr
+          - starmap_2020_8k.exr
+      exposure:
+        description: 'Linear exposure multiplier before tone mapping'
+        default: '3.5'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install image tooling (OpenImageIO + KTX-Software)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openimageio-tools
+          wget -q https://github.com/KhronosGroup/KTX-Software/releases/download/v4.3.2/KTX-Software-4.3.2-Linux-x86_64.deb
+          sudo dpkg -i KTX-Software-4.3.2-Linux-x86_64.deb
+          oiiotool --version && toktx --version
+
+      - name: Download NASA EXR
+        run: |
+          curl -fL --retry 4 -o starmap_src.exr \
+            "https://svs.gsfc.nasa.gov/vis/a000000/a004800/a004851/${{ inputs.variant }}"
+          ls -la starmap_src.exr
+
+      - name: Tone-map and resize
+        run: |
+          EXP="${{ inputs.exposure }}"
+          mkdir -p public/assets
+          # Linear-space Lanczos downsample, exposure, soft highlight rolloff,
+          # approximate sRGB encode. 16-bit PNG intermediate for KTX2 quality.
+          oiiotool starmap_src.exr \
+            --resize:filter=lanczos3 8192x4096 \
+            --mulc "$EXP" --rangecompress --clamp:min=0 --clamp:max=1 \
+            --powc 0.4545 \
+            -d uint16 -o starmap_8k.png
+          # 4k JPEG fallback (flipY-loaded by three.js TextureLoader).
+          oiiotool starmap_8k.png --resize:filter=lanczos3 4096x2048 \
+            -d uint8 --attrib "jpeg:quality" 92 -o public/assets/starmap_4k.jpg
+          # KTX2 is sampled without the flipY that TextureLoader applies —
+          # flip rows here so both assets present identically to the shader.
+          oiiotool starmap_8k.png --flip -d uint16 -o starmap_8k_flipped.png
+          toktx --genmipmap --encode uastc --uastc_quality 2 --zcmp 19 \
+            --assign_oetf srgb --assign_primaries bt709 \
+            public/assets/starmap_8k.ktx2 starmap_8k_flipped.png
+          ls -la public/assets/
+
+      - name: Commit assets to this branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add public/assets/starmap_8k.ktx2 public/assets/starmap_4k.jpg
+          git commit -m "Add processed NASA Deep Star Maps 2020 textures
+
+Source: https://svs.gsfc.nasa.gov/4851 (${{ inputs.variant }}, exposure ${{ inputs.exposure }})
+Credit: NASA/Goddard Space Flight Center Scientific Visualization Studio.
+Gaia DR2: ESA/Gaia/DPAC."
+          git push
