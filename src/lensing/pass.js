@@ -177,6 +177,13 @@ export class LensingPass {
     const prevXr = renderer.xr.enabled;
     renderer.xr.enabled = false; // offscreen pass must ignore the XR camera
 
+    // Cube faces are square 90° views (CubeCamera's fov = -90 ⇒ tan(±45°) = 1,
+    // negated to match that convention). Set this explicitly every cycle so the
+    // shared uTanHalfFov can't be left at the perspective value by renderDirect
+    // — otherwise faces render with the wrong FOV and the sphere doesn't tile
+    // (oval black hole, seams at face boundaries).
+    u.uTanHalfFov.value.set(-1, -1);
+
     for (let j = 0; j < n; j++) {
       if (this.cursor === 0 || !this._latched) {
         // Latch state for the whole cube cycle so faces stay seam-consistent.
