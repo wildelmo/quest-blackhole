@@ -152,26 +152,45 @@ export function skyLodBase(skyWidth, faceSize) {
   return Math.max(0, Math.log2(skyWidth / (faceSize * 4)));
 }
 
-// Try NASA KTX2 (CI-fetched) → NASA JPEG → procedural fallback.
-export async function loadStarmap(renderer) {
+async function loadPNG(url) {
+  const tex = await new THREE.TextureLoader().loadAsync(url);
+  configureEquirect(tex);
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.generateMipmaps = true;
+  if (tex.anisotropy !== undefined) tex.anisotropy = 8;
+  return tex;
+}
+
+// Resolution order: optional NASA KTX2 (if the fetch workflow was run) →
+// baked real HYG star catalog (ships in-repo) → procedural fallback.
+// preferHiRes picks the 8k HYG map (desktop); XR defaults to the 4k for
+// GPU-memory headroom. A `?sky=` param can force a specific source.
+export async function loadStarmap(renderer, { preferHiRes = true, force } = {}) {
   const base = import.meta.env.BASE_URL;
-  try {
-    const loader = new KTX2Loader()
-      .setTranscoderPath(`${base}basis/`)
-      .detectSupport(renderer);
-    const tex = await loader.loadAsync(`${base}assets/starmap_8k.ktx2`);
-    loader.dispose();
-    configureEquirect(tex);
-    tex.minFilter = THREE.LinearMipmapLinearFilter; // KTX2 ships its own mips
-    return { texture: tex, width: tex.image.width, source: 'nasa-ktx2' };
-  } catch { /* not fetched yet */ }
-  try {
-    const tex = await new THREE.TextureLoader().loadAsync(`${base}assets/starmap_4k.jpg`);
-    configureEquirect(tex);
-    tex.minFilter = THREE.LinearMipmapLinearFilter;
-    tex.generateMipmaps = true;
-    return { texture: tex, width: tex.image.width, source: 'nasa-jpg' };
-  } catch { /* not fetched yet */ }
-  const tex = makeProceduralStarmap({});
+
+  if (force !== 'hyg' && force !== 'procedural') {
+    try {
+      const loader = new KTX2Loader().setTranscoderPath(`${base}basis/`).detectSupport(renderer);
+      const tex = await loader.loadAsync(`${base}assets/starmap_8k.ktx2`);
+      loader.dispose();
+      configureEquirect(tex);
+      tex.minFilter = THREE.LinearMipmapLinearFilter;
+      return { texture: tex, width: tex.image.width, source: 'nasa-ktx2' };
+    } catch { /* not fetched */ }
+  }
+
+  if (force !== 'procedural') {
+    const order = preferHiRes
+      ? ['starmap_hyg_8k.png', 'starmap_hyg_4k.png']
+      : ['starmap_hyg_4k.png', 'starmap_hyg_8k.png'];
+    for (const file of order) {
+      try {
+        const tex = await loadPNG(`${base}assets/${file}`);
+        return { texture: tex, width: tex.image.width, source: `hyg-${file.includes('8k') ? '8k' : '4k'}` };
+      } catch { /* try next */ }
+    }
+  }
+
+  const tex = makeProceduralStarmap({ width: 4096 });
   return { texture: tex, width: tex.image.width, source: 'procedural' };
 }

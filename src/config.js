@@ -29,8 +29,10 @@ export const DEFAULT_TIER_DESKTOP = 4;
 // 0 = full physics. DNGR paper documents the movie shipped with beaming off.
 export const DEFAULTS = {
   cinematic: 0.65,
-  exposure: 1.15,
+  exposure: 1.0,
   diskGain: 1.0,
+  bloom: 0.5,
+  bloomThreshold: 1.25,
   timeScale: 1.15,        // sim-time units per second (inner disk lap ≈ 40 s)
 };
 

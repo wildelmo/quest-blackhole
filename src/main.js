@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { XRButton } from 'three/examples/jsm/webxr/XRButton.js';
 import { TIERS, DEFAULT_TIER_XR, DEFAULT_TIER_DESKTOP, DEFAULTS, POSES, params, numParam } from './config.js';
 import { LensingPass } from './lensing/pass.js';
+import { Present } from './present.js';
 import { loadStarmap, makeBlackbodyLUT, skyLodBase } from './sky/textures.js';
 import { makeDust, makeBlink, makeSkyRotation } from './scene.js';
 import { Controls } from './controls.js';
@@ -40,11 +41,25 @@ scene.add(camera);
 const lensing = new LensingPass();
 lensing.setBlackbody(makeBlackbodyLUT());
 lensing.setSkyRotation(makeSkyRotation());
+const exposure = numParam('exposure', DEFAULTS.exposure);
 lensing.setLook({
   cinematic: THREE.MathUtils.clamp(numParam('cine', DEFAULTS.cinematic), 0, 1),
   diskGain: numParam('disk', DEFAULTS.diskGain),
+  exposure,
 });
-scene.background = lensing.texture;
+
+// Desktop present: HDR direct render + bloom. XR uses the amortization cube
+// (scene.background) instead; the background is swapped in per frame.
+const present = new Present();
+present.setLook({
+  exposure,
+  bloom: numParam('bloom', DEFAULTS.bloom),
+  threshold: numParam('bloomthresh', DEFAULTS.bloomThreshold),
+});
+
+// Supersampling factor for the desktop direct path (native-res AA). Clamped
+// by the quality manager under load.
+const SSAA = THREE.MathUtils.clamp(numParam('ssaa', 1.35), 1, 2);
 
 const dust = makeDust();
 scene.add(dust.object);
@@ -52,6 +67,9 @@ const blink = makeBlink(camera);
 const controls = new Controls(renderer, camera, renderer.domElement);
 const hud = new Hud(camera);
 controls.onToggleHud = () => hud.toggle();
+// These overlays are composited into the HDR target (desktop) or drawn over
+// the cube (XR); tonemapping is handled at present, so don't double-apply it.
+for (const m of [dust.object.material, blink.material ?? null].filter(Boolean)) m.toneMapped = false;
 
 // Screenshot/verification mode: fixed pose, frozen time, deterministic.
 const poseIdx = numParam('pose', 0);
@@ -131,18 +149,60 @@ if (navigator.xr) {
 const clock = new THREE.Clock();
 let simTime = numParam('t0', 40); // pre-sheared disk: filaments already streaked
 let framesRendered = 0;
+const _size = new THREE.Vector2();
 
 async function start() {
-  const { texture, width, source } = await loadStarmap(renderer);
-  lensing.setSky(texture, skyLodBase(width, TIERS[tier].faceSize), source === 'procedural' ? 2.6 : 2.2);
-  if (source === 'procedural') {
-    console.info('[sky] procedural fallback star field (NASA map not fetched yet)');
-  } else {
-    console.info(`[sky] loaded ${source} (${width}px)`);
-  }
+  // Desktop renders at full resolution and can afford the 8k sky; XR takes the
+  // 4k for GPU-memory headroom.
+  const forceSky = params.get('sky') || undefined;
+  const { texture, width, source } = await loadStarmap(renderer, {
+    preferHiRes: !navigator.xr || !(await navigator.xr.isSessionSupported?.('immersive-vr').catch(() => false)),
+    force: forceSky,
+  });
+  // Real maps already carry correct star brightness — a gentle lift is enough;
+  // the procedural fallback needs more.
+  lensing.setSky(texture, skyLodBase(width, TIERS[tier].faceSize), source === 'procedural' ? 2.4 : 1.5);
+  console.info(`[sky] ${source} (${width}px)`);
   applyTier();
-
   renderer.setAnimationLoop(render);
+}
+
+function currentSSAA() {
+  // Drop supersampling before quality tiers when the desktop path is heavy.
+  return tier <= 1 ? 1.0 : SSAA;
+}
+
+function renderDesktop() {
+  scene.background = null;
+  renderer.getDrawingBufferSize(_size);
+  const s = currentSSAA();
+  present.setSize(_size.x * s, _size.y * s);
+
+  // 1. lensed universe + disk → HDR target (linear)
+  lensing.renderDirect(renderer, {
+    camera, camPos: controls.virtualPos, simTime, target: present.hdr, outputMode: 0,
+  });
+  // 2. near-field dust + overlays composited into the same HDR target
+  renderer.autoClear = false;
+  renderer.setRenderTarget(present.hdr);
+  renderer.render(scene, camera);
+  renderer.setRenderTarget(null);
+  renderer.autoClear = true;
+  // 3. bloom + ACES tonemap → screen
+  present.composite(renderer);
+}
+
+function renderXR(t) {
+  const speedBoost = controls.velocity.length() > 1.2 ? 2 : 1;
+  lensing.update(renderer, {
+    camPos: controls.virtualPos,
+    rigQuat: controls.rigQuat,
+    simTime,
+    count: Math.min(6, t.facesPerFrame * speedBoost),
+    forceAll: framesRendered === 0 || controls.snapped,
+  });
+  scene.background = lensing.texture;
+  renderer.render(scene, camera);
 }
 
 function render() {
@@ -152,31 +212,23 @@ function render() {
   controls.update(dt);
   updateQuality(dt);
   blink.set(controls.blinkAlpha);
+  dust.update(dt, controls.velocity, camera.position);
 
   const t = TIERS[tier];
-  // Fast translation makes stale faces visibly disagree at seams — refresh
-  // the cube faster while moving quickly.
-  const speedBoost = controls.velocity.length() > 1.2 ? 2 : 1;
-  lensing.update(renderer, {
-    camPos: controls.virtualPos,
-    rigQuat: controls.rigQuat,
-    simTime,
-    count: Math.min(6, t.facesPerFrame * speedBoost),
-    forceAll: framesRendered === 0 || controls.snapped || shotMode,
-  });
-
-  dust.update(dt, controls.velocity, camera.position);
+  if (renderer.xr.isPresenting) renderXR(t);
+  else renderDesktop();
 
   hud.update(dt, [
     `fps ${(1 / Math.max(dt, 1e-4)).toFixed(0)}  tier ${TIERS[tier].name}`,
-    `face ${t.faceSize}px  steps ${t.steps}  ${t.facesPerFrame}f/frame`,
+    renderer.xr.isPresenting
+      ? `XR cube ${t.faceSize}px  steps ${t.steps}`
+      : `desktop ${(_size.x * currentSSAA()) | 0}px  steps ${t.steps}`,
     `r ${controls.virtualPos.length().toFixed(1)} rs  v ${controls.velocity.length().toFixed(2)} rs/s`,
-    `${renderer.xr.isPresenting ? 'XR' : 'desktop'}  tour ${controls.tourActive ? 'on' : 'off'}`,
+    `tour ${controls.tourActive ? 'on' : 'off'}`,
   ]);
 
-  renderer.render(scene, camera);
   framesRendered++;
-  if (shotMode && framesRendered >= 3) window.__shotReady = true;
+  if (shotMode && framesRendered >= 4) window.__shotReady = true;
 }
 
 addEventListener('resize', () => {

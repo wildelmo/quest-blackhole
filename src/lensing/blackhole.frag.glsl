@@ -36,6 +36,20 @@ uniform sampler2D uBlackbody; // 256×1 LUT, 1000 K → 12000 K, linear RGB (pea
 uniform float uCinematic;   // 1 = movie look (shifts muted), 0 = full physics
 uniform float uDiskGain;
 uniform float uGlow;
+uniform int uOutputMode;    // 0 = linear HDR (to cube), 1 = tonemapped (to screen)
+uniform float uExposure;
+
+// ------------------------------------------------------------- tonemap ----
+
+vec3 acesFilmic(vec3 x) {
+  // Narkowicz 2015 ACES approximation.
+  const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+vec3 linearToSRGB(vec3 c) {
+  return mix(1.055 * pow(max(c, 0.0), vec3(1.0 / 2.4)) - 0.055, c * 12.92,
+             vec3(lessThanEqual(c, vec3(0.0031308))));
+}
 
 // ---------------------------------------------------------------- noise ----
 
@@ -80,55 +94,61 @@ vec3 skyColor(vec3 dir, float lodBias) {
 
 // Emission + coverage of the thin disk at plane-crossing point p.
 // marchDir = ray marching direction (unit, camera → scene) at the crossing.
+// Structure is built from a seamless azimuthal phase that winds into spiral
+// filaments (differential Keplerian rotation), sampled anisotropically so
+// features are smooth laminar bands, not radial streaks.
 vec4 diskSample(vec3 p, vec3 marchDir) {
   float r = length(p.xz);
-  float win = smoothstep(R_IN, R_IN * 1.22, r) *
-              (1.0 - smoothstep(R_OUT * 0.62, R_OUT, r));
+  float win = smoothstep(R_IN, R_IN * 1.10, r) *
+              (1.0 - smoothstep(R_OUT * 0.80, R_OUT, r));
   if (win <= 0.001) return vec4(0.0);
 
-  // Differential rotation: rigid rotation per-radius → Keplerian shear, no φ seam.
-  float om = 0.70710678 / (r * sqrt(r));   // Ω = 1/√(2 r³)
-  float ang = om * uTime;
-  float ca = cos(ang), sa = sin(ang);
-  vec2 q = mat2(ca, -sa, sa, ca) * p.xz;
-
-  // Streaky filaments: log-radial bands distorted by a swirled field.
   float lr = log(r);
-  float distort = fbm(q * 0.55);
-  float rings = fbm(vec2(lr * 9.0, distort * 3.1 + 2.0));
-  float clumps = fbm(q * 1.15 + vec2(31.0));
-  float density = (0.45 + 0.55 * rings) * (0.6 + 0.4 * clumps);
-  density = pow(density, 1.35);
+  float phi = atan(p.z, p.x);
+  float om = 0.70710678 / (r * sqrt(r));         // Ω = 1/√(2 r³), Keplerian
 
-  // Temperature: hot white inner region → deep orange rim, dimmed at the
-  // very inner edge (quasi Page–Thorne), modulated by the turbulence.
-  float T = 6600.0 * pow(3.0 / r, 0.66)
-          * (0.58 + 0.42 * smoothstep(2.9, 4.6, r))
-          * (0.82 + 0.5 * rings);
+  // Seamless spiral phase: winds tighter inward and advects with rotation.
+  // Sampling noise on (cos,sin) of this phase has no 2π seam anywhere.
+  float phase = phi + om * uTime - 5.5 * lr;
+  vec2 azi = vec2(cos(phase), sin(phase));
 
-  // Relativistic shifts. Photon propagation dir at emission = -marchDir
-  // (we trace backwards from the camera).
-  float v = clamp(1.0 / sqrt(max(2.0 * (r - 1.0), 0.4)), 0.0, 0.85); // local orbital speed
+  // Broad spiral arms → finer filaments → fine detail. Each octave is
+  // decorrelated across radius by an lr offset so rings don't repeat.
+  float arms = fbm(azi * 1.6 + vec2(0.0, lr * 1.7));
+  float fil  = fbm(azi * 3.6 + vec2(lr * 3.0, arms * 1.4));
+  float fine = fbm(azi * 7.5 + vec2(lr * 5.0, fil * 1.5));
+  float density = 0.45 * arms + 0.4 * fil + 0.2 * fine;
+  density = smoothstep(0.16, 0.9, density);      // laminar contrast, dark gaps
+  density = mix(density, 1.0, 0.14);             // thin continuous floor
+
+  // Temperature: white-hot inner edge → amber rim (∝ r^-3/4 Shakura–Sunyaev),
+  // with the innermost annulus dimmed toward ISCO (quasi Page–Thorne).
+  float T = 11000.0 * pow(R_IN / r, 0.62)
+          * (0.62 + 0.38 * smoothstep(R_IN, R_IN * 1.7, r));
+
+  // Relativistic shifts. Photon propagation dir at emission = -marchDir.
+  float v = clamp(1.0 / sqrt(max(2.0 * (r - 1.0), 0.4)), 0.0, 0.85);
   float gamma = 1.0 / sqrt(1.0 - v * v);
-  vec3 beta = v * vec3(p.z, 0.0, -p.x) / r;     // prograde (+Y angular momentum)
+  vec3 beta = v * vec3(p.z, 0.0, -p.x) / r;       // prograde (+Y angular momentum)
   float gDop = 1.0 / (gamma * (1.0 - dot(beta, -marchDir)));
   float gGrav = sqrt(max(1.0 - 1.0 / r, 0.02));
-  float g = gDop * gGrav;                        // ν_obs / ν_em
+  float g = gDop * gGrav;                          // ν_obs / ν_em
 
-  // Cinematic blend: the film shipped with these shifts switched off.
+  // Cinematic blend: the film shipped with beaming/shift switched off.
   float gCol = mix(g, 1.0, uCinematic);
   float beamExp = mix(3.0, 0.35, uCinematic);
-  float beam = pow(clamp(g, 0.35, 2.8), beamExp);
+  float beam = pow(clamp(g, 0.4, 2.6), beamExp);
 
   float Tobs = clamp(T * gCol, 1000.0, 12000.0);
   vec3 bb = texture(uBlackbody, vec2((Tobs - 1000.0) / 11000.0, 0.5)).rgb;
 
-  // Grazing rays traverse more disk material.
-  float grazing = clamp(0.14 / max(abs(marchDir.y), 0.05), 1.0, 3.2);
+  // Gentle limb brightening for grazing rays (thin-disk path length), capped
+  // low so it reads as a bright rim, not a streak.
+  float grazing = clamp(0.35 / max(abs(marchDir.y), 0.18), 1.0, 1.9);
 
-  float lum = pow(T / 6600.0, 4.0);              // Stefan–Boltzmann-ish falloff
-  vec3 emission = bb * lum * density * beam * win * uDiskGain * 26.0;
-  float alpha = clamp(win * (0.5 + 0.6 * density) * grazing * 0.75, 0.0, 0.92);
+  float lum = pow(T / 6600.0, 2.1);               // radial luminance falloff
+  vec3 emission = bb * lum * density * beam * win * uDiskGain * 2.4;
+  float alpha = clamp(win * (0.35 + 0.65 * density) * grazing, 0.0, 0.95);
   return vec4(emission * grazing, alpha);
 }
 
@@ -232,5 +252,13 @@ void main() {
   float halo = exp(-abs(bGlow - B_CRIT) * 5.5);
   col += uGlow * halo * vec3(1.0, 0.78, 0.5) * uDiskGain * (captured ? 1.15 : 1.0);
 
+  // uOutputMode 0: write linear HDR (into the cube RT — tonemapped later at
+  // present). 1: this is the final image (direct desktop path) — expose +
+  // ACES filmic + sRGB here so RawShaderMaterial output is display-ready.
+  if (uOutputMode == 1) {
+    col *= uExposure;
+    col = acesFilmic(col);
+    col = linearToSRGB(col);
+  }
   outColor = vec4(col, 1.0);
 }
