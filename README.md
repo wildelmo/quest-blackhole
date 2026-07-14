@@ -11,7 +11,9 @@ Everything you see is computed per-frame in a fragment shader: null geodesics
 are integrated through the Schwarzschild metric, so the shadow, the photon
 ring, the doubled over/under image of the disk's far side, and the
 Einstein-ring warping of the background stars all emerge from the physics —
-nothing is painted on.
+nothing is painted on. The star field is a **real sky** baked from the HYG
+catalog (~119,000 actual stars with their true positions, magnitudes, and
+B–V colors), so the constellations lensing around the hole are the real ones.
 
 ## Try it
 
@@ -31,25 +33,34 @@ Useful URL parameters: `?tier=0..4` (fixed quality), `?cine=0..1`
 
 1. **Enable Pages:** Settings → Pages → Source: **GitHub Actions**. The
    `Deploy to GitHub Pages` workflow publishes `dist/` on every push to
-   `main`.
-2. **Fetch the real sky (recommended):** Actions → **Fetch NASA star map
+   `main`. That's it — the real HYG star map ships in the repo, so it looks
+   right out of the box.
+2. **Optional — even sharper HDR sky:** Actions → **Fetch NASA star map
    assets** → Run workflow. Runners download NASA's *Deep Star Maps 2020*
-   HDR EXR (1.7 billion real stars, Gaia DR2), tone-map + downsample it, and
-   commit an 8k KTX2 (GPU-compressed) primary and a 4k JPEG fallback. Until
-   then the app renders a procedural star field so it works out of the box.
+   HDR EXR (1.7 billion stars, Gaia DR2) and commit a GPU-compressed KTX2;
+   the loader prefers it automatically if present.
 
-## How it stays fast on a headset
+## Rendering
 
-- The black hole and stars are at optical infinity, so **one mono cubemap
-  centered on the head is stereo-correct**. The expensive lensing shader
-  renders into that offscreen cubemap **round-robin (a few faces per frame)**
-  while both eyes just sample it — head rotation costs nothing, and the eye
-  buffers stay at full sharpness.
+Two paths share one geodesic shader:
+
+- **Desktop** ray-traces the whole frame at native resolution (with mild
+  supersampling) into an HDR buffer, then applies a two-scale bloom and an
+  ACES filmic tonemap. This is where the sharpness and the disk's molten glow
+  come from.
+- **On a headset**, the black hole and stars are at optical infinity, so
+  **one mono cubemap centered on the head is stereo-correct**. The expensive
+  shader renders into that offscreen cubemap **round-robin (a few faces per
+  frame)** while both eyes just sample it — head rotation costs nothing, and
+  the eye buffers stay at full sharpness.
+
+Common tricks:
+
 - Rays that pass far from the hole (impact parameter `b > 15 r_s`, beyond any
   possible disk intersection) take an analytic weak-field bend instead of the
   full march — only the central cone pays for geodesic integration.
-- A quality manager watches frame times and steps face resolution, march step
-  count, and refresh cadence up/down (5 tiers, auto by default).
+- A quality manager watches frame times and steps march count, supersampling,
+  cube-face resolution, and refresh cadence up/down (5 tiers, auto by default).
 
 ## The physics
 
@@ -75,13 +86,19 @@ npm run dev     # local dev server
 npm test        # geodesic physics self-tests
 npm run build   # production build to dist/
 npm run shot    # headless screenshots of canned poses (needs Chromium)
+npm run starmap # re-bake the HYG star maps into public/assets (downloads the catalog)
 ```
 
 ## Credits & licenses
 
 - Code: MIT (this repository).
-- Star map: **NASA/Goddard Space Flight Center Scientific Visualization
-  Studio. Gaia DR2: ESA/Gaia/DPAC** — [Deep Star Maps 2020](https://svs.gsfc.nasa.gov/4851).
+- Star map (default): baked from the **HYG stellar database** by David Nash /
+  astronexus ([HYG-Database](https://github.com/astronexus/HYG-Database),
+  public domain), which compiles the Hipparcos, Yale Bright Star, and Gliese
+  catalogs.
+- Optional HDR sky: **NASA/Goddard Space Flight Center Scientific
+  Visualization Studio. Gaia DR2: ESA/Gaia/DPAC** —
+  [Deep Star Maps 2020](https://svs.gsfc.nasa.gov/4851).
 - Lensing technique after [oseiskar/black-hole](https://github.com/oseiskar/black-hole)
   (MIT) and [ebruneton/black_hole_shader](https://github.com/ebruneton/black_hole_shader)
   (BSD-3-Clause).

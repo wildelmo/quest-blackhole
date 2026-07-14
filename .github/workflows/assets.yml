@@ -37,11 +37,21 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install image tooling (OpenImageIO + KTX-Software)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends openimageio-tools
-          wget -q https://github.com/KhronosGroup/KTX-Software/releases/download/v4.3.2/KTX-Software-4.3.2-Linux-x86_64.deb
-          sudo dpkg -i KTX-Software-4.3.2-Linux-x86_64.deb
+          # Resolve the latest KTX-Software Linux .deb dynamically so a pinned
+          # version can't rot; fall back to a known-good release if the API is
+          # unavailable.
+          DEB_URL=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/KhronosGroup/KTX-Software/releases/latest \
+            | grep -o 'https://[^"]*Linux-x86_64\.deb' | head -1)
+          DEB_URL=${DEB_URL:-https://github.com/KhronosGroup/KTX-Software/releases/download/v4.3.2/KTX-Software-4.3.2-Linux-x86_64.deb}
+          echo "Installing $DEB_URL"
+          wget -q "$DEB_URL" -O ktx.deb
+          sudo dpkg -i ktx.deb || sudo apt-get install -f -y
           oiiotool --version && toktx --version
 
       - name: Download NASA EXR
@@ -77,9 +87,8 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add public/assets/starmap_8k.ktx2 public/assets/starmap_4k.jpg
-          git commit -m "Add processed NASA Deep Star Maps 2020 textures
-
-Source: https://svs.gsfc.nasa.gov/4851 (${{ inputs.variant }}, exposure ${{ inputs.exposure }})
-Credit: NASA/Goddard Space Flight Center Scientific Visualization Studio.
-Gaia DR2: ESA/Gaia/DPAC."
+          git commit \
+            -m "Add processed NASA Deep Star Maps 2020 textures" \
+            -m "Source: https://svs.gsfc.nasa.gov/4851 (${{ inputs.variant }}, exposure ${{ inputs.exposure }})" \
+            -m "Credit: NASA/Goddard Space Flight Center Scientific Visualization Studio. Gaia DR2: ESA/Gaia/DPAC."
           git push

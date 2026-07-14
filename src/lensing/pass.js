@@ -43,6 +43,8 @@ export class LensingPass {
         uCinematic: { value: 0.65 },
         uDiskGain: { value: 1.0 },
         uGlow: { value: 0.32 },
+        uOutputMode: { value: 0 },
+        uExposure: { value: 1.15 },
       },
     });
 
@@ -131,11 +133,34 @@ export class LensingPass {
     this.markDirty();
   }
 
-  setLook({ cinematic, diskGain, glow }) {
+  setLook({ cinematic, diskGain, glow, exposure }) {
     const u = this.material.uniforms;
     if (cinematic !== undefined) u.uCinematic.value = cinematic;
     if (diskGain !== undefined) u.uDiskGain.value = diskGain;
     if (glow !== undefined) u.uGlow.value = glow;
+    if (exposure !== undefined) u.uExposure.value = exposure;
+  }
+
+  // Direct full-resolution ray trace for the non-XR path: renders one ray per
+  // output pixel from the actual perspective camera into `target` (an HDR RT
+  // for the bloom chain), bypassing the amortization cube entirely. This is
+  // where desktop gets its sharpness — no cube undersampling.
+  renderDirect(renderer, { camera, camPos, simTime, target, outputMode = 0 }) {
+    const u = this.material.uniforms;
+    camera.updateMatrixWorld();
+    this._m4.extractRotation(camera.matrixWorld);
+    u.uBasis.value.setFromMatrix4(this._m4);
+    const th = Math.tan(THREE.MathUtils.degToRad(camera.fov) * 0.5);
+    u.uTanHalfFov.value.set(th * camera.aspect, th);
+    u.uCamPos.value.copy(camPos);
+    u.uTime.value = simTime;
+    u.uOutputMode.value = outputMode;
+
+    const prev = renderer.getRenderTarget();
+    renderer.setRenderTarget(target ?? null);
+    renderer.render(this.fsScene, this.fsCam);
+    renderer.setRenderTarget(prev);
+    u.uOutputMode.value = 0; // restore for the cube path
   }
 
   // Force the next update to restart the cycle at face 0 (fresh latch).
