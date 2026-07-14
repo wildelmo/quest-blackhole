@@ -205,6 +205,23 @@ function renderXR(t) {
   renderer.render(scene, camera);
 }
 
+// Debug: exercise the VR cube path on desktop (?cube). Faithfully reproduces
+// the desktop→VR handoff — the desktop path runs renderDirect first (which
+// leaves uTanHalfFov at the perspective value), then we render through the
+// cube exactly as VR does. If the cube path is not self-contained, the black
+// hole comes out oval with seams at the face boundaries.
+const forceCube = params.has('cube');
+function renderCubeDebug() {
+  lensing.renderDirect(renderer, {
+    camera, camPos: controls.virtualPos, simTime, target: present.hdr, outputMode: 0,
+  });
+  lensing.update(renderer, {
+    camPos: controls.virtualPos, rigQuat: controls.rigQuat, simTime, forceAll: true,
+  });
+  scene.background = lensing.texture;
+  renderer.render(scene, camera);
+}
+
 function render() {
   const dt = Math.min(clock.getDelta(), 0.1);
   if (!shotMode) simTime += dt * DEFAULTS.timeScale;
@@ -216,6 +233,7 @@ function render() {
 
   const t = TIERS[tier];
   if (renderer.xr.isPresenting) renderXR(t);
+  else if (forceCube) renderCubeDebug();
   else renderDesktop();
 
   hud.update(dt, [
